@@ -10,6 +10,139 @@ export function isPolyfilled() {
   return !/native code/i.test((globalThis.CommandEvent || {}).toString());
 }
 
+function getRootNode(node) {
+  if (node && typeof node.getRootNode === "function") {
+    return node.getRootNode();
+  }
+  if (node && node.parentNode) return getRootNode(node.parentNode);
+  return node;
+}
+
+function createListeners() {
+  const processedEvents = new WeakSet();
+
+  function handleInvokerActivation(event) {
+    if (processedEvents.has(event)) return;
+
+    processedEvents.add(event);
+
+    if (event.defaultPrevented) return;
+    if (event.type !== "click") return;
+    const source = event.composedPath().find((el) => el.matches?.("button[commandfor], button[command]"));
+    if (!source) return;
+
+    if (source.form && source.getAttribute("type") !== "button") {
+      event.preventDefault();
+      throw new Error(
+        "Element with `commandFor` is a form participant. " +
+          "It should explicitly set `type=button` in order for `commandFor` to work. " +
+          "In order for it to act as a Submit button, it must not have command or commandfor attributes",
+      );
+    }
+
+    if (source.hasAttribute("command") !== source.hasAttribute("commandfor")) {
+      const attr = source.hasAttribute("command") ? "command" : "commandfor";
+      const missing = source.hasAttribute("command") ? "commandfor" : "command";
+      throw new Error(
+        `Element with ${attr} attribute must also have a ${missing} attribute to function.`,
+      );
+    }
+
+    if (
+      source.command !== "show-popover" &&
+      source.command !== "hide-popover" &&
+      source.command !== "toggle-popover" &&
+      source.command !== "show-modal" &&
+      source.command !== "request-close" &&
+      source.command !== "close" &&
+      !source.command.startsWith("--")
+    ) {
+      console.warn(
+        `"${source.command}" is not a valid command value. Custom commands must begin with --`,
+      );
+      return;
+    }
+
+    const invokee = source.commandForElement;
+    if (!invokee) return;
+    const invokeEvent = new CommandEvent("command", {
+      command: source.command,
+      source,
+      cancelable: true,
+    });
+    invokee.dispatchEvent(invokeEvent);
+    if (invokeEvent.defaultPrevented) return;
+
+    const command = invokeEvent.command.toLowerCase();
+
+    if (invokee.popover) {
+      const canShow = !invokee.matches(":popover-open");
+      const shouldShow =
+        canShow && (command === "toggle-popover" || command === "show-popover");
+      const shouldHide = !canShow && command === "hide-popover";
+
+      if (shouldShow) {
+        invokee.showPopover({ source });
+      } else if (shouldHide) {
+        invokee.hidePopover();
+      }
+    } else if (invokee.localName === "dialog") {
+      const canShow = !invokee.hasAttribute("open");
+
+      if (canShow && command == "show-modal") {
+        invokee.showModal();
+      } else if (!canShow && command == "close") {
+        invokee.close(source.value ? source.value : undefined);
+      } else if (!canShow && command == "request-close") {
+        // requestClose is only supported from Safari 18.4, so we polyfill it on older browsers
+        if (!HTMLDialogElement.prototype.requestClose) {
+          HTMLDialogElement.prototype.requestClose = function () {
+            const cancelEvent = new Event("cancel", { cancelable: true });
+            this.dispatchEvent(cancelEvent);
+
+            if (!cancelEvent.defaultPrevented) {
+              this.close();
+            }
+          };
+        }
+
+        invokee.requestClose(source.value ? source.value : undefined);
+      }
+    }
+  }
+
+  function setupInvokeListeners(target) {
+    target.addEventListener("click", handleInvokerActivation, true);
+  }
+
+  return { setupInvokeListeners };
+}
+
+function createMutationObserver(root) {
+  const oncommandObserver = new MutationObserver((records) => {
+    for (const record of records) {
+      const { target } = record;
+      if (record.type === "childList") {
+        applyOnCommandHandler(target.querySelectorAll("[oncommand]"));
+      } else {
+        applyOnCommandHandler([target]);
+      }
+    }
+  });
+  oncommandObserver.observe(root, {
+    subtree: true,
+    childList: true,
+    attributeFilter: ["oncommand"],
+  });
+  return oncommandObserver;
+}
+
+function applyOnCommandHandler(els) {
+  for (const el of els) {
+    el.oncommand = new Function("event", el.getAttribute("oncommand"));
+  }
+}
+
 export function apply() {
   document.addEventListener(
     "command",
@@ -27,14 +160,6 @@ export function apply() {
       ...Object.getOwnPropertyDescriptor(obj, key),
       enumerable,
     });
-  }
-
-  function getRootNode(node) {
-    if (node && typeof node.getRootNode === "function") {
-      return node.getRootNode();
-    }
-    if (node && node.parentNode) return getRootNode(node.parentNode);
-    return node;
   }
 
   const commandEventSourceElements = new WeakMap();
@@ -193,123 +318,11 @@ export function apply() {
       },
     },
   });
-  function applyOnCommandHandler(els) {
-    for (const el of els) {
-      el.oncommand = new Function("event", el.getAttribute("oncommand"));
-    }
-  }
-  const oncommandObserver = new MutationObserver((records) => {
-    for (const record of records) {
-      const { target } = record;
-      if (record.type === "childList") {
-        applyOnCommandHandler(target.querySelectorAll("[oncommand]"));
-      } else {
-        applyOnCommandHandler([target]);
-      }
-    }
-  });
-  oncommandObserver.observe(document, {
-    subtree: true,
-    childList: true,
-    attributeFilter: ["oncommand"],
-  });
+
+  const oncommandObserver = createMutationObserver(document);
   applyOnCommandHandler(document.querySelectorAll("[oncommand]"));
 
-  const processedEvents = new WeakSet();
-
-  function handleInvokerActivation(event) {
-    if (processedEvents.has(event)) return;
-
-    processedEvents.add(event);
-
-    if (event.defaultPrevented) return;
-    if (event.type !== "click") return;
-    const source = event.composedPath().find((el) => el.matches?.("button[commandfor], button[command]"));
-    if (!source) return;
-
-    if (source.form && source.getAttribute("type") !== "button") {
-      event.preventDefault();
-      throw new Error(
-        "Element with `commandFor` is a form participant. " +
-          "It should explicitly set `type=button` in order for `commandFor` to work. " +
-          "In order for it to act as a Submit button, it must not have command or commandfor attributes",
-      );
-    }
-
-    if (source.hasAttribute("command") !== source.hasAttribute("commandfor")) {
-      const attr = source.hasAttribute("command") ? "command" : "commandfor";
-      const missing = source.hasAttribute("command") ? "commandfor" : "command";
-      throw new Error(
-        `Element with ${attr} attribute must also have a ${missing} attribute to function.`,
-      );
-    }
-
-    if (
-      source.command !== "show-popover" &&
-      source.command !== "hide-popover" &&
-      source.command !== "toggle-popover" &&
-      source.command !== "show-modal" &&
-      source.command !== "request-close" &&
-      source.command !== "close" &&
-      !source.command.startsWith("--")
-    ) {
-      console.warn(
-        `"${source.command}" is not a valid command value. Custom commands must begin with --`,
-      );
-      return;
-    }
-
-    const invokee = source.commandForElement;
-    if (!invokee) return;
-    const invokeEvent = new CommandEvent("command", {
-      command: source.command,
-      source,
-      cancelable: true,
-    });
-    invokee.dispatchEvent(invokeEvent);
-    if (invokeEvent.defaultPrevented) return;
-
-    const command = invokeEvent.command.toLowerCase();
-
-    if (invokee.popover) {
-      const canShow = !invokee.matches(":popover-open");
-      const shouldShow =
-        canShow && (command === "toggle-popover" || command === "show-popover");
-      const shouldHide = !canShow && command === "hide-popover";
-
-      if (shouldShow) {
-        invokee.showPopover({ source });
-      } else if (shouldHide) {
-        invokee.hidePopover();
-      }
-    } else if (invokee.localName === "dialog") {
-      const canShow = !invokee.hasAttribute("open");
-
-      if (canShow && command == "show-modal") {
-        invokee.showModal();
-      } else if (!canShow && command == "close") {
-        invokee.close(source.value ? source.value : undefined);
-      } else if (!canShow && command == "request-close") {
-        // requestClose is only supported from Safari 18.4, so we polyfill it on older browsers
-        if (!HTMLDialogElement.prototype.requestClose) {
-          HTMLDialogElement.prototype.requestClose = function () {
-            const cancelEvent = new Event("cancel", { cancelable: true });
-            this.dispatchEvent(cancelEvent);
-
-            if (!cancelEvent.defaultPrevented) {
-              this.close();
-            }
-          };
-        }
-
-        invokee.requestClose(source.value ? source.value : undefined);
-      }
-    }
-  }
-
-  function setupInvokeListeners(target) {
-    target.addEventListener("click", handleInvokerActivation, true);
-  }
+  const { setupInvokeListeners } = createListeners();
 
   function observeShadowRoots(ElementClass, callback) {
     const attachShadow = ElementClass.prototype.attachShadow;
@@ -337,4 +350,15 @@ export function apply() {
   setupInvokeListeners(document);
 
   Object.assign(globalThis, { CommandEvent });
+  return { oncommandObserver }
+}
+
+export function observeShadowRoot(shadow, { oncommandObserver = null } = {}) {
+  const { setupInvokeListeners } = createListeners();
+  setupInvokeListeners(shadow);
+
+  oncommandObserver = oncommandObserver || createMutationObserver(shadow);
+  oncommandObserver.observe(shadow, { attributeFilter: ["oncommand"] });
+
+  applyOnCommandHandler(shadow.querySelectorAll("[oncommand]"));
 }
